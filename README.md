@@ -8,8 +8,8 @@ Implementation of **HiDe-Tab** evaluated on two Czech sociological datasets.
 
 | File | Dataset |
 |------|---------|
-| `PIAAC_dataset_HiDe_Tab.py` | PIAAC Czech (Cycle 1 & 2) |
-| `Kult2012_dataset_HiDe_Tab.py` | Kult2012 (private) |
+| `PIAAC dataset_HiDe_Tab.py` | PIAAC Czech (Cycle 1 & 2) |
+| `Kult2012 dataset_HiDe_Tab.py` | Kult2012 (private) |
 
 ---
 
@@ -49,7 +49,7 @@ A CUDA GPU is recommended. Both scripts fall back to CPU automatically.
 
 ### PIAAC
 
-Edit the top of `PIAAC_dataset_HiDe_Tab.py`:
+Edit the top of `PIAAC dataset_HiDe_Tab.py`:
 
 ```python
 DATA_PATH    = "PIAAC PUF dataset\\Cycle 1\\prgczep1.csv"
@@ -64,7 +64,7 @@ python PIAAC dataset_HiDe_Tab.py
 
 ### Kult2012
 
-Edit the top of `Kult2012_dataset_HiDe_Tab.py`:
+Edit the top of `Kult2012 dataset_HiDe_Tab.py`:
 
 ```python
 DATA_PATH = r"path\to\Kult2012_....sav"
