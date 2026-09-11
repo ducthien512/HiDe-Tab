@@ -37,8 +37,8 @@ A Czech social survey (3,679 respondents, 275 variables) covering cultural parti
 
 ```bash
 pip install numpy pandas scikit-learn scipy matplotlib seaborn torch
-pip install tensorflow    # PIAAC only
-pip install pyreadstat    # Kult2012 only (.sav reading)
+pip install tensorflow
+pip install pyreadstat
 ```
 
 A CUDA GPU is recommended. Both scripts fall back to CPU automatically.
