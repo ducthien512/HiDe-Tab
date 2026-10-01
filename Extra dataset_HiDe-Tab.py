@@ -1,15 +1,6 @@
 """
 HiDe-Tab on Four Public Sociological Datasets  (FIXED VERSION)
 Methods : CTGAN | Diffusion | HiDe-Tab | TabDiff | TabSyn
-
-Key changes vs. previous version
-  * Target column is modelled jointly -> TSTR uses REAL synthetic labels (no feature-derived fallback).
-  * Metrics follow the paper equations (pooled Cohen's d, full m x m Corr, DCR_p5 / RR_p5 / PR).
-  * EMA fixed (warm-up, GPU-resident), LR scheduler stepped per epoch, GPU batch loader.
-  * CTGAN generator uses Gumbel-softmax (discriminator no longer sees logits vs one-hot).
-  * HiDe-Tab: shared residual encoder, scale-invariant TC, FiLM-MLP denoisers trained jointly.
-  * DDIM sampling (all diffusion methods), min-gradient-step floor for small datasets.
-  * Numeric calibration is a flag applied to ALL methods (default off).
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
