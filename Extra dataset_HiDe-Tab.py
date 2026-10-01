@@ -1,5 +1,5 @@
 """
-HiDe-Tab on Four Public Sociological Datasets  (FIXED VERSION)
+HiDe-Tab on Four Public Sociological Datasets
 Methods : CTGAN | Diffusion | HiDe-Tab | TabDiff | TabSyn
 """
 
