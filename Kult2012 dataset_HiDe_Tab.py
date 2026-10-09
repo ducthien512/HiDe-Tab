@@ -19,6 +19,10 @@ DATA_PATH = (
 N_SYNTH        = 5000
 PURE_SYNTHETIC = True
 
+# Independent runs: every method is re-trained, re-sampled and re-evaluated once per seed,
+SEEDS          = [42, 43, 44]
+PLOT_ALL_SEEDS = False      # False -> loss/corr/t-SNE/PCA plots only for SEEDS[0] (saves time)
+
 METHODS = [
     "CTGAN",
     "Diffusion",
@@ -109,9 +113,16 @@ def _select_device():
     return torch.device("cpu")
 
 DEVICE = _select_device()
-SEED = 42
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-if DEVICE.type == "cuda": torch.cuda.manual_seed_all(SEED)
+SEED = SEEDS[0]            # "current" seed; read by evaluate_all / TSNE / PCA at call time
+
+def set_all_seeds(seed):
+    """Re-seed python, NumPy and PyTorch and update the global SEED used by sklearn calls."""
+    global SEED
+    SEED = int(seed)
+    random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+    if DEVICE.type == "cuda": torch.cuda.manual_seed_all(SEED)
+
+set_all_seeds(SEEDS[0])
 
 OUT = Path(OUTPUT_DIR); PLOT_DIR = OUT/"plots"
 OUT.mkdir(exist_ok=True); PLOT_DIR.mkdir(exist_ok=True)
@@ -1793,8 +1804,10 @@ class _W:
     def __init__(self,fn): self._fn=fn
     def sample(self,n): return self._fn(n)
 
-def run_one(name, train_fn, X_gpu, proc, real_df, n_synth, pure_syn, X_real_enc):
-    print(f"\n{'─'*64}\n  ▶  {name}  │  {n_synth} rows  │  {X_gpu.shape[1]} dims\n{'─'*64}")
+def run_one(name, train_fn, X_gpu, proc, real_df, n_synth, pure_syn, X_real_enc, seed=None):
+    seed = SEEDS[0] if seed is None else seed
+    set_all_seeds(seed)          # identical start state for every (method, seed) pair
+    print(f"\n{'─'*64}\n  ▶  {name}  │  seed={seed}  │  {n_synth} rows  │  {X_gpu.shape[1]} dims\n{'─'*64}")
     t0=time.time(); lh=[]
     res=train_fn(X_gpu,lh)
     obj=res if hasattr(res,"sample") else _W(res)
@@ -1818,29 +1831,32 @@ def run_one(name, train_fn, X_gpu, proc, real_df, n_synth, pure_syn, X_real_enc)
     Xs = _calibrate_numeric(Xs, X_real_enc, proc.num_dims)
 
     syn_df=proc.inverse_transform(Xs)
-    fp=OUT/f"{name}_synthetic_n{n_synth}.csv"
+    fp=OUT/f"{name}_synthetic_n{n_synth}_seed{seed}.csv"
     syn_df.to_csv(fp,index=False,encoding="utf-8-sig"); print(f"    → {fp}")
 
     if not pure_syn:
         pd.concat([real_df.assign(_source="real"),syn_df.assign(_source="synthetic")]
-                  ).to_csv(OUT/f"{name}_combined_n{n_synth}.csv",index=False,encoding="utf-8-sig")
+                  ).to_csv(OUT/f"{name}_combined_n{n_synth}_seed{seed}.csv",index=False,encoding="utf-8-sig")
 
     m=evaluate_all(name,real_df,syn_df,X_real_enc,Xs,proc)
-    m["time_s"]=round(time.time()-t0,1); m["n_synth"]=n_synth
+    m["time_s"]=round(time.time()-t0,1); m["n_synth"]=n_synth; m["seed"]=seed
     m["numeric_oob_frac"]=round(oob_frac,5)   # <-- NEW
     print(f"    JSD={m['jsd_mean']}  AvgD={m['avg_cohens_d']}  CorrDiff={m['corr_diff']}\n"
           f"    Acc={m['ml_accuracy']}  F1={m['ml_f1_macro']}  AUC={m['ml_auc']}  R²={m['reg_r2']}\n"
           f"    DCR={m['privacy_dcr']}  PR={m['privacy_ratio']}  OOB={m['numeric_oob_frac']}  ({m['time_s']}s)")
 
-    # Plots
-    plot_loss(lh, name)
+    # Plots (SEEDS[0] keeps the original file names; other seeds get a _seed suffix if enabled)
+    if seed != SEEDS[0] and not PLOT_ALL_SEEDS:
+        return m
+    pname = name if seed == SEEDS[0] else f"{name}_seed{seed}"
+    plot_loss(lh, pname)
     enc_names=[]
     for sp,(s,e) in zip(proc.specs,proc.slices):
         if sp.kind=="num": enc_names.append(sp.name)
         else: enc_names+=[f"{sp.name}_{k}" for k in range(e-s)]
-    plot_corr(X_real_enc,Xs,enc_names,name)
-    plot_tsne(X_real_enc,Xs,name)
-    plot_pca(X_real_enc,Xs,name)
+    plot_corr(X_real_enc,Xs,enc_names,pname)
+    plot_tsne(X_real_enc,Xs,pname)
+    plot_pca(X_real_enc,Xs,pname)
     return m
 
 # ==============================================================================
@@ -1902,6 +1918,34 @@ def _dispatch(proc):
                     _W(train_hidetab_variant(X, proc, name=vn, loss_history=lh, **c)))
     return D
 
+_METRIC_COLS = ["jsd_mean","stat_sim","avg_cohens_d","corr_diff","ml_accuracy","ml_f1_macro",
+                "ml_auc","reg_r2","privacy_dcr","privacy_ratio","numeric_oob_frac","time_s"]
+
+def aggregate_seeds(results_all):
+    """per-seed rows -> (mean/std DataFrame, display DataFrame 'mean ± std', list of mean-dicts)."""
+    df_all = pd.DataFrame(results_all)
+    for c in _METRIC_COLS:
+        df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
+    order = [m for m in METHODS if m in set(df_all["method"])]
+    g = df_all.groupby("method")[_METRIC_COLS]
+    mean = g.mean().reindex(order); std = g.std(ddof=1).reindex(order).fillna(0.0)
+    cnt = df_all.groupby("method")["seed"].nunique().reindex(order)
+    ms = pd.DataFrame({"method": order, "n_seeds": cnt.values})
+    for c in _METRIC_COLS:
+        ms[f"{c}_mean"] = mean[c].round(4).values
+        ms[f"{c}_std"]  = std[c].round(4).values
+    disp = pd.DataFrame({"method": order})
+    for c in _METRIC_COLS:
+        disp[c] = [f"{a:.4f} ± {b:.4f}" if not math.isnan(a) else "nan"
+                   for a, b in zip(mean[c].values, std[c].values)]
+    mean_dicts = []
+    for m in order:
+        d = {"method": m}
+        for c in _METRIC_COLS:
+            v = float(mean.loc[m, c]); d[c] = round(v, 4) if not math.isnan(v) else "nan"
+        mean_dicts.append(d)
+    return df_all, ms, disp, mean_dicts
+
 def main():
     sep="═"*68
     print(f"\n{sep}")
@@ -1913,6 +1957,7 @@ def main():
     print(f"  Batch={BATCH_SIZE}  LR={LR}  LATENT={LATENT_DIM}  "
           f"Stride={TRANSFORMER_STRIDE}  num_w={NUM_LOSS_WEIGHT}")
     print(f"  Methods: {', '.join(METHODS)}")
+    print(f"  Seeds  : {SEEDS}")
     print(f"{sep}\n")
 
     raw=load_sav(DATA_PATH); df=preprocess_df(raw); print()
@@ -1922,21 +1967,27 @@ def main():
     print(f"[info] Tensor {tuple(X.shape)}  ({X.element_size()*X.nelement()/1024**2:.1f} MB)\n")
 
     D=_dispatch(proc); results=[]
-    for name in METHODS:
-        if name not in D: print(f"[skip] {name}"); continue
-        m=run_one(name,D[name],X,proc,df,N_SYNTH,PURE_SYNTHETIC,X_np)
-        results.append(m)
+    for seed in SEEDS:
+        print(f"\n{sep}\n  SEED {seed}\n{sep}")
+        for name in METHODS:
+            if name not in D: print(f"[skip] {name}"); continue
+            try:
+                results.append(run_one(name,D[name],X,proc,df,N_SYNTH,PURE_SYNTHETIC,X_np,seed=seed))
+            except Exception as e:
+                import traceback; print(f"  [ERROR] {name} seed={seed}: {e}"); traceback.print_exc()
 
     if results:
-        plot_comparison(results)
-        df_s=pd.DataFrame(results); fp=OUT/"summary_metrics.csv"
-        df_s.to_csv(fp,index=False,encoding="utf-8-sig")
-        cols = ["method", "jsd_mean", "avg_cohens_d", "corr_diff", "ml_accuracy",
-                "ml_f1_macro", "ml_auc", "reg_r2", "privacy_dcr", "privacy_ratio",
-                "numeric_oob_frac", "time_s"]
-        print(f"\n{sep}\n  SUMMARY\n{sep}")
-        print(df_s[cols].to_string(index=False))
-        print(f"\n  CSV  → {fp.resolve()}\n  Plots→ {PLOT_DIR.resolve()}")
+        df_all, df_ms, df_disp, mean_dicts = aggregate_seeds(results)
+        df_all.to_csv(OUT/"summary_metrics_all_seeds.csv", index=False, encoding="utf-8-sig")
+        df_ms.to_csv(OUT/"summary_metrics_mean_std.csv", index=False, encoding="utf-8-sig")
+        pd.DataFrame(mean_dicts).to_csv(OUT/"summary_metrics.csv", index=False, encoding="utf-8-sig")
+        plot_comparison(mean_dicts)
+        cols = ["method"] + _METRIC_COLS
+        print(f"\n{sep}\n  SUMMARY  (mean ± std over seeds {SEEDS})\n{sep}")
+        print(df_disp[cols].to_string(index=False))
+        print(f"\n  per-seed CSV   → {(OUT/'summary_metrics_all_seeds.csv').resolve()}"
+              f"\n  mean ± std CSV → {(OUT/'summary_metrics_mean_std.csv').resolve()}"
+              f"\n  Plots          → {PLOT_DIR.resolve()}")
 
 if __name__=="__main__":
     main()

@@ -30,8 +30,9 @@ PURE_SYNTHETIC = True
 # 1.00 → keep ALL requested features, impute everything
 MISSING_THRESHOLD = 1.00
 
-# Random seed — set once here, propagated to NumPy, TF, sklearn everywhere
 RANDOM_SEED    = 42
+# Independent generator runs: every method is re-trained / re-sampled / re-evaluated once per
+SEEDS          = [42, 43, 44]
 # Number of repeated evaluation runs (for mean ± std reporting in paper)
 N_EVAL_RUNS    = 5
 
@@ -115,6 +116,21 @@ if _HAS_TORCH:
         torch.cuda.manual_seed_all(RANDOM_SEED)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+CURRENT_SEED = SEEDS[0]      # read at call time by evaluate_method / evaluate_method_repeated
+
+def set_all_seeds(seed):
+    """Re-seed Python, NumPy, TensorFlow and PyTorch and update CURRENT_SEED."""
+    global CURRENT_SEED
+    CURRENT_SEED = int(seed)
+    np.random.seed(CURRENT_SEED)
+    tf.random.set_seed(CURRENT_SEED)
+    _random.seed(CURRENT_SEED)
+    os.environ['PYTHONHASHSEED'] = str(CURRENT_SEED)
+    if _HAS_TORCH:
+        torch.manual_seed(CURRENT_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(CURRENT_SEED)
 
 for d in ["outputs/comparison", "outputs/plots",
           "outputs/data", "outputs/logs"]:
@@ -1510,14 +1526,14 @@ def evaluate_method(real_df, synth_df, method_name):
     Xr_clf = real_df[ml_feats]
     Xs_clf = synth_df[ml_feats]
     # 80/20 stratified split — stratify keeps class balance in test set
-    # test_size=0.2 and random_state=RANDOM_SEED ensure reproducibility
+    # test_size=0.2 and random_state=CURRENT_SEED ensure reproducibility
     Xtr, Xte, ytr, yte = train_test_split(
         Xr_clf, y_real, test_size=0.2,
-        random_state=RANDOM_SEED, stratify=y_real)
+        random_state=CURRENT_SEED, stratify=y_real)
     def clf_scores(X_train, y_train):
         # Random Forest: 100 trees, fixed seed, all CPU cores
         clf = RandomForestClassifier(
-            n_estimators=100, random_state=RANDOM_SEED, n_jobs=-1)
+            n_estimators=100, random_state=CURRENT_SEED, n_jobs=-1)
         clf.fit(X_train, y_train)
         pred = clf.predict(Xte)
         prob = clf.predict_proba(Xte)[:, 1]
@@ -1535,10 +1551,10 @@ def evaluate_method(real_df, synth_df, method_name):
     ys = synth_df[score_col]
     # Regression: same 80/20 split, fixed seed
     Xtr2, Xte2, ytr2, yte2 = train_test_split(
-        real_df[ml_feats], yr, test_size=0.2, random_state=RANDOM_SEED)
+        real_df[ml_feats], yr, test_size=0.2, random_state=CURRENT_SEED)
     def reg_scores(X_train, y_train):
         reg = RandomForestRegressor(
-            n_estimators=100, random_state=RANDOM_SEED, n_jobs=-1)
+            n_estimators=100, random_state=CURRENT_SEED, n_jobs=-1)
         reg.fit(X_train, y_train)
         pred = reg.predict(Xte2)
         return {'rmse': np.sqrt(mean_squared_error(yte2, pred)),
@@ -1602,7 +1618,7 @@ def evaluate_method_repeated(real_df, synth_df, method_name, n_runs=N_EVAL_RUNS)
     Run evaluate_method N_EVAL_RUNS times with different random seeds
     and return mean ± std for AUC and R² (key ML utility metrics).
     Statistical metrics (KS, JSD, Cohen's d) are deterministic given
-    the same data so they are only computed once (seed=RANDOM_SEED).
+    the same data so they are only computed once (seed=CURRENT_SEED).
     """
     # Deterministic metrics — compute once
     base = evaluate_method(real_df, synth_df, method_name)
@@ -1621,7 +1637,7 @@ def evaluate_method_repeated(real_df, synth_df, method_name, n_runs=N_EVAL_RUNS)
     y_real     = (real_df[score_col] > median_val).astype(int)
     yr         = real_df[score_col]
     y_synth    = (synth_df[score_col] > median_val).astype(int)
-    for run_seed in range(RANDOM_SEED, RANDOM_SEED + n_runs):
+    for run_seed in range(CURRENT_SEED, CURRENT_SEED + n_runs):
         Xtr, Xte, ytr, yte = train_test_split(
             real_df[ml_feats], y_real, test_size=0.2,
             random_state=run_seed, stratify=y_real)
@@ -1657,45 +1673,102 @@ method_funcs = [run_gan, run_diffusion]
 if _HAS_TORCH:
     method_funcs += [run_hidetab, run_tabdiff, run_tabsyn]
 
-all_results        = []
-all_synthetic_data = {}
-training_histories = {}
+all_synthetic_data = {}      # synthetic data of SEEDS[0] (used by plots / combined datasets)
+training_histories = {}      # training histories of SEEDS[0]
+per_seed_results   = {}      # tag -> list of eval_res (one per seed)
 
-for i, fn in enumerate(method_funcs):
-    try:
-        print(f"\n{'='*60}\nMETHOD {i+1} / {len(method_funcs)}\n{'='*60}")
-        if fn.__name__ == 'run_gan':
-            result = fn(X, n_to_generate, scaler, features, df_clean)
-        else:
-            result = fn(X, n_to_generate, scaler, features)
-        if result.get('_skipped'):
-            print(f"  ⚠ {result['method']} was skipped.")
-            continue
-        synth_df = pd.DataFrame(result['data'], columns=features)
-        synth_df = postprocess(synth_df)
-        tag = result['method']
-        synth_df.to_csv(
-            f"outputs/data/synthetic_{tag}_mode{FEATURE_MODE}.csv",
-            index=False)
-        all_synthetic_data[tag] = synth_df
-        training_histories[tag] = {
-            'loss': result['history'],
-            'final_loss': result['final_loss'],
-            'time': result['time'],
-        }
-        print(f"\n  Evaluating …")
-        eval_res = evaluate_method_repeated(df_clean, synth_df, tag, N_EVAL_RUNS)
-        eval_res['training_time'] = result['time']
-        eval_res['final_loss']    = result['final_loss']
-        eval_res['n_generated']   = len(synth_df)
-        all_results.append(eval_res)
-        print(f"  ✓ {tag}: {len(synth_df)} samples  "
-              f"|  {result['time']:.1f}s  "
-              f"|  loss {result['final_loss']:.4f}")
-    except Exception as exc:
-        import traceback
-        print(f"  ✗ ERROR in {fn.__name__}: {exc}")
-        traceback.print_exc()
+for seed_idx, SEED_I in enumerate(SEEDS):
+    print("\n" + "#" * 60 + f"\n#  SEED {SEED_I}  ({seed_idx + 1}/{len(SEEDS)})\n" + "#" * 60)
+    for i, fn in enumerate(method_funcs):
+        try:
+            set_all_seeds(SEED_I)        # identical start state for every (method, seed) pair
+            print(f"\n{'='*60}\nSEED {SEED_I} | METHOD {i+1} / {len(method_funcs)}\n{'='*60}")
+            if fn.__name__ == 'run_gan':
+                result = fn(X, n_to_generate, scaler, features, df_clean)
+            else:
+                result = fn(X, n_to_generate, scaler, features)
+            if result.get('_skipped'):
+                print(f"  ⚠ {result['method']} was skipped.")
+                continue
+            synth_df = pd.DataFrame(result['data'], columns=features)
+            synth_df = postprocess(synth_df)
+            tag = result['method']
+            synth_df.to_csv(
+                f"outputs/data/synthetic_{tag}_mode{FEATURE_MODE}_seed{SEED_I}.csv",
+                index=False)
+            if seed_idx == 0:
+                synth_df.to_csv(
+                    f"outputs/data/synthetic_{tag}_mode{FEATURE_MODE}.csv",
+                    index=False)
+                all_synthetic_data[tag] = synth_df
+                training_histories[tag] = {
+                    'loss': result['history'],
+                    'final_loss': result['final_loss'],
+                    'time': result['time'],
+                }
+            print(f"\n  Evaluating …")
+            eval_res = evaluate_method_repeated(df_clean, synth_df, tag, N_EVAL_RUNS)
+            eval_res['training_time'] = result['time']
+            eval_res['final_loss']    = result['final_loss']
+            eval_res['n_generated']   = len(synth_df)
+            eval_res['seed']          = SEED_I
+            per_seed_results.setdefault(tag, []).append(eval_res)
+            print(f"  ✓ {tag} [seed {SEED_I}]: {len(synth_df)} samples  "
+                  f"|  {result['time']:.1f}s  "
+                  f"|  loss {result['final_loss']:.4f}")
+        except Exception as exc:
+            import traceback
+            print(f"  ✗ ERROR in {fn.__name__} (seed {SEED_I}): {exc}")
+            traceback.print_exc()
+
+# ── Aggregate over seeds ─────────────────────────────────────────────────────
+def _is_num(v):
+    return isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+
+def _agg_mean(items):
+    """Recursively average the numeric leaves of nested result dicts; keep other leaves from run 1."""
+    first = items[0]
+    if isinstance(first, dict):
+        return {k: _agg_mean([it[k] for it in items if isinstance(it, dict) and k in it])
+                for k in first}
+    if all(_is_num(v) for v in items):
+        return float(np.nanmean(items))
+    return first
+
+def _flatten(d, prefix=""):
+    out = {}
+    for k, v in d.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.update(_flatten(v, key + "."))
+        elif _is_num(v):
+            out[key] = float(v)
+    return out
+
+all_results = []
+flat_rows = []
+for tag, runs in per_seed_results.items():
+    agg = _agg_mean(runs)
+    agg['n_seeds'] = len(runs)
+    if len(runs) > 1:
+        _auc = [r.get('auc_mean', r['ml_classification']['synthetic']['auc']) for r in runs]
+        _r2  = [r.get('r2_mean',  r['ml_regression']['synthetic']['r2'])      for r in runs]
+        agg['auc_std'] = float(np.std(_auc, ddof=1))     # std ACROSS generator seeds
+        agg['r2_std']  = float(np.std(_r2,  ddof=1))
+    all_results.append(agg)
+    for r in runs:
+        flat_rows.append({'method': tag, 'seed': r['seed'], **_flatten(r)})
+
+if flat_rows:
+    df_flat = pd.DataFrame(flat_rows)
+    df_flat.to_csv(f"outputs/comparison/per_seed_metrics_mode{FEATURE_MODE}.csv", index=False)
+    num_cols = [c for c in df_flat.columns if c not in ('method', 'seed')]
+    g = df_flat.groupby('method')[num_cols]
+    ms = g.mean().add_suffix('_mean').join(g.std(ddof=1).fillna(0.0).add_suffix('_std'))
+    ms.insert(0, 'n_seeds', df_flat.groupby('method')['seed'].nunique())
+    ms.reset_index().to_csv(
+        f"outputs/comparison/mean_std_over_seeds_mode{FEATURE_MODE}.csv", index=False)
+    print(f"\n  Saved per-seed and mean±std tables → outputs/comparison/  (seeds {SEEDS})")
 
 # ============================================================
 # COMBINED DATASETS
@@ -2008,6 +2081,7 @@ json_results = {
         'pure_synthetic':    PURE_SYNTHETIC,
         'missing_threshold': MISSING_THRESHOLD,
         'random_seed':       RANDOM_SEED,
+        'seeds':             SEEDS,
         'n_eval_runs':       N_EVAL_RUNS,
         'n_original':        n_original,
         'n_generated':       n_to_generate,

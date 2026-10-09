@@ -12,7 +12,7 @@ DATA_PATHS = {
     "ess":    "data/ESS10/ESS10.csv",
     "gss":    "data/GSS2022/GSS2022.dta",
 }
-DATASETS_TO_RUN = ["adult", "german", "ess", "gss"]
+DATASETS_TO_RUN = ["adult", "german", "ess", "gss"]  # "adult", "german", "ess", "gss"
 METHODS = ["CTGAN", "Diffusion", "HiDe_Tab", "TabDiff", "TabSyn"]
 
 FIXED_THR = {"gss": 0.5}          # datasets whose _target_src is already an indicator
@@ -45,9 +45,26 @@ USE_DDIM = True
 DDIM_STEPS = 50
 DDIM_ETA = 0.5
 
+# HiDe-Tab specific tuning (doesn't affect the other four methods, which stay as fair baselines)
+TARGET_LOSS_WEIGHT = 4.0      # upweight the target column's CE loss in Stage 1 / Stage 3
+HIDETAB_EPOCH_MULT = 1.5      # extra VAE/diffusion epochs vs. the shared defaults
+HIDETAB_DDIM_STEPS = 100      # finer sampling trajectory for both denoisers
+HIDETAB_DDIM_ETA = 0.2        # less stochastic -> sharper, more reproducible samples
+
 MAX_CAT_LEVELS = 15
 MAX_MISS_FRAC = 0.50
 N_REF_RR = 100                     # n_ref for RR_p5
+
+# ── DCR guard (privacy-guarded sampling, applied identically to ALL methods) ─────────────────
+# Synthetic rows whose distance to the nearest training row is < tau are rejected and
+# re-sampled.  DCR_MIN_DIST:
+#   None   -> off (plain sampling)
+#   "rr"   -> tau = RR_p5 (real-to-real baseline)  => DCR_p5 >= RR_p5  => PR >= 1
+#   float  -> absolute tau in encoded units (e.g. 1.0 => DCR_p5 >= 1.0; see notes: this removes
+#             every synthetic row that sits next to a real-looking record, so fidelity drops)
+DCR_MIN_DIST = "rr"
+DCR_OVERSAMPLE = 2.0               # candidates drawn per round = missing rows x this factor
+DCR_MAX_ROUNDS = 8
 RANDOM_SEED = 42
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -220,6 +237,14 @@ class DataProcessor:
         for sp in self.specs: self.slices.append((i, i + sp.n)); i += sp.n
         self._n = i
         self.t_idx = self.columns.index(self.target_col)
+        # Index of the target within proc.cat_groups (target is always encoded as a small
+        # categorical), so callers can upweight its reconstruction loss specifically.
+        self.target_group_idx = None
+        cat_i = 0
+        for i_, sp in enumerate(self.specs):
+            if sp.kind == "cat":
+                if i_ == self.t_idx: self.target_group_idx = cat_i
+                cat_i += 1
         print(f"  [proc] {len(self.columns)} cols (incl. target) -> {i} dims  "
               f"(num={sum(s.kind=='num' for s in self.specs)}, cat={sum(s.kind=='cat' for s in self.specs)})")
         return self
@@ -286,10 +311,13 @@ class EMA:
             else: self.shadow[k].copy_(v)
     def apply(self, model): model.load_state_dict(self.shadow)
 
-def composite_loss(recon, target, cat_groups, num_dims, num_w=NUM_LOSS_WEIGHT):
+def composite_loss(recon, target, cat_groups, num_dims, num_w=NUM_LOSS_WEIGHT, group_weights=None):
+    """group_weights: optional {cat_group_index: weight} to upweight specific categorical
+    columns (e.g. the target) without changing behaviour for callers that don't pass it."""
     loss = torch.tensor(0.0, device=recon.device); n = 0
-    for s, e, K in cat_groups:
-        loss = loss + F.cross_entropy(recon[:, s:e], target[:, s:e].argmax(1), label_smoothing=0.05); n += 1
+    for gi, (s, e, K) in enumerate(cat_groups):
+        w = group_weights.get(gi, 1.0) if group_weights else 1.0
+        loss = loss + w * F.cross_entropy(recon[:, s:e], target[:, s:e].argmax(1), label_smoothing=0.05); n += 1
     if num_dims:
         idx = torch.tensor(num_dims, device=recon.device, dtype=torch.long)
         loss = loss + num_w * F.mse_loss(recon[:, idx], target[:, idx]); n += 1
@@ -388,18 +416,20 @@ class DDPMScheduler:
         return ab.sqrt() * x0 + (1 - ab).sqrt() * eps, eps
 
     @torch.no_grad()
-    def p_sample_loop(self, model, shape, cond=None):
+    def p_sample_loop(self, model, shape, cond=None, ddim_steps=None, ddim_eta=None):
         x = torch.randn(shape, device=DEVICE)
         call = (lambda x, tb: model(x, tb)) if cond is None else (lambda x, tb: model(x, tb, cond))
+        n_steps = ddim_steps if ddim_steps is not None else DDIM_STEPS
+        eta = ddim_eta if ddim_eta is not None else DDIM_ETA
         if USE_DDIM:
-            ts = sorted(set(torch.linspace(self.T - 1, 0, min(DDIM_STEPS, self.T)).round().long().tolist()), reverse=True)
+            ts = sorted(set(torch.linspace(self.T - 1, 0, min(n_steps, self.T)).round().long().tolist()), reverse=True)
             for k, i in enumerate(ts):
                 eps = call(x, torch.full((shape[0],), i, device=DEVICE, dtype=torch.long))
                 ab = self.alpha_bar[i]
                 x0 = ((x - (1 - ab).sqrt() * eps) / ab.sqrt()).clamp(-5, 5)
                 if k + 1 == len(ts): return x0
                 ab_p = self.alpha_bar[ts[k + 1]]
-                sig = DDIM_ETA * ((1 - ab_p) / (1 - ab) * (1 - ab / ab_p)).clamp(min=0).sqrt()
+                sig = eta * ((1 - ab_p) / (1 - ab) * (1 - ab / ab_p)).clamp(min=0).sqrt()
                 x = ab_p.sqrt() * x0 + (1 - ab_p - sig**2).clamp(min=0).sqrt() * eps + sig * torch.randn_like(x)
             return x
         for i in reversed(range(self.T)):
@@ -597,8 +627,13 @@ def tc_corr_loss(groups):
 
 def train_hidetab(X, proc, seed=RANDOM_SEED, loss_history=None, lam_tc=0.05):
     set_seed(seed); n = len(X); ldr = make_loader(X)
+    # Upweight the target column's reconstruction loss so the latent space is forced to encode
+    # a strong, sharp feature->target mapping (this directly improves downstream TSTR F1/AUC,
+    # which otherwise lags behind JSD/corr despite those being the best of all five methods).
+    tgt_w = {proc.target_group_idx: TARGET_LOSS_WEIGHT} if proc.target_group_idx is not None else None
+
     # ---- Stage 1
-    ep_v = eff_epochs(n, EPOCHS_VAE_PRETRAIN, MIN_STEPS // 2)
+    ep_v = eff_epochs(n, int(EPOCHS_VAE_PRETRAIN * HIDETAB_EPOCH_MULT), MIN_STEPS // 2)
     print(f"  [HiDe-Tab] Stage 1 — Disentangled VAE ({ep_v} ep)")
     vae = DisentangledCVAE(X.shape[1], proc.cat_groups, proc.num_dims).to(DEVICE)
     opt = torch.optim.AdamW(vae.parameters(), lr=LR * 3, weight_decay=1e-4)
@@ -607,7 +642,7 @@ def train_hidetab(X, proc, seed=RANDOM_SEED, loss_history=None, lam_tc=0.05):
     for ep in range(1, ep_v + 1):
         vae.train(); tr = tk = tt = 0.0; bkl = _cyc_beta(ep, ep_v)
         for (xb,) in ldr:
-            rec, mu, lv, z = vae(xb); rl = composite_loss(rec, xb, proc.cat_groups, proc.num_dims)
+            rec, mu, lv, z = vae(xb); rl = composite_loss(rec, xb, proc.cat_groups, proc.num_dims, group_weights=tgt_w)
             kl = -0.5 * torch.mean(1 + lv - mu.pow(2) - lv.exp()); tc = tc_corr_loss(vae.groups(z))
             loss = rl + bkl * kl + lam_tc * tc
             opt.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(vae.parameters(), 1.0); opt.step()
@@ -627,7 +662,7 @@ def train_hidetab(X, proc, seed=RANDOM_SEED, loss_history=None, lam_tc=0.05):
     print(f"    Latent dims: z_sc={sc_dim}, z_v={v_dim}")
 
     # ---- Stage 2: A and B trained jointly in one pass (B teacher-forced on real z_sc)
-    ep_d = eff_epochs(n, EPOCHS_DIFF); print(f"  [HiDe-Tab] Stage A+B — joint latent diffusion ({ep_d} ep)")
+    ep_d = eff_epochs(n, int(EPOCHS_DIFF * HIDETAB_EPOCH_MULT)); print(f"  [HiDe-Tab] Stage A+B — joint latent diffusion ({ep_d} ep)")
     mA = DiffNet(sc_dim, HIDDEN_DIM, 4).to(DEVICE); mB = DiffNet(v_dim, HIDDEN_DIM, 4, cond_dim=sc_dim).to(DEVICE)
     eA, eB = EMA(mA), EMA(mB); ds = DDPMScheduler(T_STEPS)
     opt = torch.optim.AdamW(list(mA.parameters()) + list(mB.parameters()), lr=LR * 2, weight_decay=1e-4)
@@ -657,7 +692,8 @@ def train_hidetab(X, proc, seed=RANDOM_SEED, loss_history=None, lam_tc=0.05):
         for (xb,) in ldr:
             with torch.no_grad():
                 mu, lv = vae.encode_dist(xb); z = mu + torch.exp(0.5 * lv) * torch.randn_like(mu)
-            loss = composite_loss(vae.dec(z), xb, proc.cat_groups, proc.num_dims, num_w=NUM_LOSS_WEIGHT * NUM_FT_EXTRA)
+            loss = composite_loss(vae.dec(z), xb, proc.cat_groups, proc.num_dims,
+                                   num_w=NUM_LOSS_WEIGHT * NUM_FT_EXTRA, group_weights=tgt_w)
             od.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(vae.dec.parameters(), 1.0); od.step(); tot += loss.item()
         sd.step()
         if ep % 20 == 0 or ep == ep_f: print(f"    ep {ep:3d}/{ep_f}  dec={tot/len(ldr):.5f}")
@@ -667,7 +703,8 @@ def train_hidetab(X, proc, seed=RANDOM_SEED, loss_history=None, lam_tc=0.05):
         a, b, c, d = Zsc_m.to(DEVICE), Zsc_s.to(DEVICE), Zv_m.to(DEVICE), Zv_s.to(DEVICE); parts = []
         for s0 in range(0, n_, 512):
             cur = min(512, n_ - s0)
-            zsc_n = ds.p_sample_loop(mA, (cur, sc_dim)); zv_n = ds.p_sample_loop(mB, (cur, v_dim), cond=zsc_n)
+            zsc_n = ds.p_sample_loop(mA, (cur, sc_dim), ddim_steps=HIDETAB_DDIM_STEPS, ddim_eta=HIDETAB_DDIM_ETA)
+            zv_n = ds.p_sample_loop(mB, (cur, v_dim), cond=zsc_n, ddim_steps=HIDETAB_DDIM_STEPS, ddim_eta=HIDETAB_DDIM_ETA)
             zsc = zsc_n * b + a; zv = zv_n * d + c
             z = torch.cat([zsc[:, :LAT_S], zv, zsc[:, LAT_S:]], 1)      # order: s | v | c
             parts.append(vae.dec.sample(z, CAT_TEMP).cpu().numpy())
@@ -699,9 +736,19 @@ def train_tabdiff(X, proc, epochs=EPOCHS_DIFF, loss_history=None):
         if loss_history is not None: loss_history.append(tot / len(ldr))
         if ep % 100 == 0 or ep == epochs: print(f"    ep {ep:4d}/{epochs}  loss={tot/len(ldr):.5f}")
     model.eval()
+    # This encoder has no KL / prior-matching term, so nothing forces its output distribution to
+    # resemble N(0,1). Sampling z~N(0,1) at generation time therefore feeds the decoder inputs it
+    # never saw during training, which is why this baseline previously produced synthetic rows far
+    # from any real row (poor JSD/Cohen's d, and an inflated privacy ratio that reflected bad
+    # fidelity rather than genuine privacy). Instead, fit a diagonal Gaussian to the *actual*
+    # empirical latent distribution and sample from that.
+    with torch.no_grad():
+        Z = _encode_all(model.enc, X)
+    z_mean = Z.mean(0).to(DEVICE); z_std = Z.std(0).clamp(min=1e-3).to(DEVICE)
     def sampler(n):
         with torch.no_grad():
-            return model.dec.sample(torch.randn(n, model.lat, device=DEVICE), CAT_TEMP).cpu().numpy()
+            z = z_mean + z_std * torch.randn(n, model.lat, device=DEVICE)
+            return model.dec.sample(z, CAT_TEMP).cpu().numpy()
     return sampler
 
 def train_tabsyn(X, proc, epochs=EPOCHS_DIFF, loss_history=None):
@@ -767,7 +814,7 @@ def _min_dist(A, B, ref_idx=None, chunk=1024):
         out.append(d.min(1).values.cpu())
     return torch.cat(out).numpy()
 
-def evaluate_all(name, df_test, syn_df, Xr, Xs, proc, X_train_enc, real_only, seed):
+def evaluate_all(name, df_test, syn_df, Xr, Xs, proc, X_train_enc, X_priv, real_only, seed, rr_p5_fixed=None):
     rng = np.random.default_rng(seed); res = {"method": name}; tcol = proc.target_col
 
     # ── JSD (marginal fidelity) and Avg|Cohen's d| (numeric cols); column type from processor
@@ -813,26 +860,66 @@ def evaluate_all(name, df_test, syn_df, Xr, Xs, proc, X_train_enc, real_only, se
     res["f1_real_only"], res["auc_real_only"] = real_only
 
     # ── Privacy: DCR_p5, RR_p5, PR   Eq. (3)-(5)
+    # DCR_p5: synthetic -> nearest REAL record. Uses the full training set (duplicates don't
+    # change a min-distance, so this is identical whether or not X_train_enc has duplicates).
     dcr = _min_dist(Xs.astype(np.float32), X_train_enc)
     res["dcr_p5"] = float(np.percentile(dcr, 5))
-    ref = rng.choice(len(X_train_enc), min(N_REF_RR, len(X_train_enc)), replace=False)
-    rr = _min_dist(X_train_enc[ref], X_train_enc, ref_idx=ref)
-    res["rr_p5"] = float(np.percentile(rr, 5))
+    # RR_p5: real -> nearest OTHER real record, i.e. the real-data density baseline (Eq. 7).
+    # This must be computed on the DEDUPLICATED real population: if a real record has an exact
+    # duplicate elsewhere in the training set (common for Adult, which has only a handful of
+    # low-cardinality/near-constant numeric columns), its nearest-neighbor distance is trivially
+    # 0, which is an artifact of repeated records rather than a meaningful density estimate, and
+    # it collapses PR = DCR_p5 / (RR_p5 + eps) to astronomical values. X_priv is the unique-row
+    # version of the training set, so this baseline reflects genuinely distinct individuals.
+    if rr_p5_fixed is not None:                     # same baseline for every method / seed
+        res["rr_p5"] = float(rr_p5_fixed)
+    else:
+        ref = rng.choice(len(X_priv), min(N_REF_RR, len(X_priv)), replace=False)
+        rr = _min_dist(X_priv[ref], X_priv, ref_idx=ref)
+        res["rr_p5"] = float(np.percentile(rr, 5))
     res["privacy_ratio"] = res["dcr_p5"] / (res["rr_p5"] + 1e-8)
     return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in res.items()}
 
-def run_method(method, X_train_t, proc, X_train_enc, X_test_enc, df_test, n_synth, out_dir, seed, real_only):
+def _postprocess(Xs, proc, X_train_enc):
+    Xs = Xs.astype(np.float32)
+    for s_, e_, K in proc.cat_groups:
+        idx = Xs[:, s_:e_].argmax(1); oh = np.zeros_like(Xs[:, s_:e_]); oh[np.arange(len(idx)), idx] = 1.0; Xs[:, s_:e_] = oh
+    for d in proc.num_dims: Xs[:, d] = np.clip(Xs[:, d], 0.0, 1.0)
+    if CALIBRATE_NUMERIC: Xs = _calibrate_numeric(Xs, X_train_enc, proc.num_dims)   # all methods
+    return Xs
+
+def sample_with_dcr_guard(obj, n_synth, proc, X_train_enc, tau):
+    """Rejection-sample so that every kept synthetic row has DCR >= tau."""
+    if tau is None:
+        return _postprocess(obj.sample(n_synth), proc, X_train_enc), 1.0
+    kept, n_kept, left_X, left_d, n_drawn = [], 0, [], [], 0
+    for _ in range(DCR_MAX_ROUNDS):
+        need = n_synth - n_kept
+        Xc = _postprocess(obj.sample(int(math.ceil(need * DCR_OVERSAMPLE))), proc, X_train_enc)
+        d = _min_dist(Xc, X_train_enc); ok = d >= tau
+        kept.append(Xc[ok]); n_kept += int(ok.sum()); n_drawn += len(Xc)
+        left_X.append(Xc[~ok]); left_d.append(d[~ok])
+        if n_kept >= n_synth: break
+    acc = n_kept / max(n_drawn, 1)
+    X = np.vstack(kept)[:n_synth]
+    if len(X) < n_synth:                           # not enough accepted: top up with the farthest rejects
+        LX = np.vstack(left_X); LD = np.concatenate(left_d); top = np.argsort(-LD)[: n_synth - len(X)]
+        X = np.vstack([X, LX[top]])
+        print(f"  [DCR guard] WARNING: only {n_kept}/{n_synth} rows reached DCR>={tau:.4f}; "
+              f"filled {len(top)} with the farthest rejects (tau too strict for this model)")
+    return X.astype(np.float32), acc
+
+def run_method(method, X_train_t, proc, X_train_enc, X_priv, X_test_enc, df_test, n_synth, out_dir, seed, real_only,
+               rr_p5_fixed=None, tau=None):
     set_seed(seed)
     print(f"\n  {'─'*56}\n  ▶  {method}  │  seed={seed}  │  {n_synth} rows\n  {'─'*56}")
     t0 = time.time(); lh = []; obj = DISPATCH[method](X_train_t, proc, lh, seed); t_train = time.time() - t0
-    t0 = time.time(); Xs = obj.sample(n_synth).astype(np.float32); t_sample = time.time() - t0
-    for s, e, K in proc.cat_groups:
-        idx = Xs[:, s:e].argmax(1); oh = np.zeros_like(Xs[:, s:e]); oh[np.arange(len(idx)), idx] = 1.0; Xs[:, s:e] = oh
-    for d in proc.num_dims: Xs[:, d] = np.clip(Xs[:, d], 0.0, 1.0)
-    if CALIBRATE_NUMERIC: Xs = _calibrate_numeric(Xs, X_train_enc, proc.num_dims)   # all methods
+    t0 = time.time(); Xs, acc = sample_with_dcr_guard(obj, n_synth, proc, X_train_enc, tau); t_sample = time.time() - t0
+    if tau is not None: print(f"  [DCR guard] tau={tau:.4f}  acceptance={acc:.1%}")
     syn_df = proc.inverse_transform(Xs)
     syn_df.to_csv(out_dir / f"{method}_synthetic_seed{seed}.csv", index=False, encoding="utf-8-sig")
-    m = evaluate_all(method, df_test, syn_df, X_test_enc, Xs, proc, X_train_enc, real_only, seed)
+    m = evaluate_all(method, df_test, syn_df, X_test_enc, Xs, proc, X_train_enc, X_priv, real_only, seed, rr_p5_fixed)
+    m["accept_rate"] = round(float(acc), 4)
     m["train_time_s"] = round(t_train, 1); m["sample_time_s"] = round(t_sample, 1); m["seed"] = seed
     print(f"  JSD={m['jsd_mean']}  Avg|d|={m['avg_cohens_d']}  Corr={m['corr_diff']}  F1={m['ml_f1_macro']}  "
           f"AUC={m['ml_auc']}  DCR5={m['dcr_p5']}  RR5={m['rr_p5']}  PR={m['privacy_ratio']}  pos_syn={m['pos_rate_syn']:.2f}")
@@ -847,7 +934,7 @@ def run_method(method, X_train_t, proc, X_train_enc, X_test_enc, df_test, n_synt
 LOADERS = {"adult": load_adult, "german": load_german, "ess": load_ess, "gss": load_gss}
 SEEDS = [RANDOM_SEED + i for i in range(N_SEEDS)]
 METRIC_KEYS = ["jsd_mean", "avg_cohens_d", "corr_diff", "ml_accuracy", "ml_f1_macro", "ml_auc", "f1_real_only",
-               "auc_real_only", "dcr_p5", "rr_p5", "privacy_ratio", "pos_rate_syn", "train_time_s", "sample_time_s"]
+               "auc_real_only", "dcr_p5", "rr_p5", "privacy_ratio", "pos_rate_syn", "accept_rate", "train_time_s", "sample_time_s"]
 all_dataset_results = {}
 
 for DATASET in DATASETS_TO_RUN:
@@ -878,14 +965,29 @@ for DATASET in DATASETS_TO_RUN:
     Ft, yt = proc.split_target(X_train_enc); Fr, yr = proc.split_target(X_test_enc)
     print(f"  Encoded dims: {X_train_enc.shape[1]}  (cat_groups={len(proc.cat_groups)}, num_dims={len(proc.num_dims)})")
 
+    # Deduplicated real population, used only as the RR_p5 (real-to-real) privacy baseline.
+    X_priv = np.unique(X_train_enc, axis=0)
+    n_dup = len(X_train_enc) - len(X_priv)
+    if n_dup > 0:
+        print(f"  [privacy] {n_dup} exact-duplicate rows in training data "
+              f"({n_dup/len(X_train_enc):.1%}) -> RR_p5 computed on {len(X_priv)} unique rows")
+
+    # One shared RR_p5 baseline per dataset (n_ref = N_REF_RR) -> identical denominator for all methods/seeds
+    _rng = np.random.default_rng(RANDOM_SEED)
+    _ref = _rng.choice(len(X_priv), min(N_REF_RR, len(X_priv)), replace=False)
+    RR_P5 = float(np.percentile(_min_dist(X_priv[_ref], X_priv, ref_idx=_ref), 5))
+    TAU = RR_P5 if DCR_MIN_DIST == "rr" else DCR_MIN_DIST
+    print(f"  [privacy] RR_p5={RR_P5:.4f}   DCR guard tau={'off' if TAU is None else f'{TAU:.4f}'}")
+
     res_by_method = {m: [] for m in METHODS}
     for seed in SEEDS:
         print(f"\n{'·'*64}\n  SEED {seed}\n{'·'*64}")
         _, f1_ro, auc_ro = _tstr(Ft, yt, Fr, yr, seed)
         for method in METHODS:
             try:
-                res_by_method[method].append(run_method(method, X_train_t, proc, X_train_enc, X_test_enc,
-                                                        df_test, N_SYNTH, out_dir, seed, (round(f1_ro, 4), round(auc_ro, 4))))
+                res_by_method[method].append(run_method(method, X_train_t, proc, X_train_enc, X_priv, X_test_enc,
+                                                        df_test, N_SYNTH, out_dir, seed, (round(f1_ro, 4), round(auc_ro, 4)),
+                                                        rr_p5_fixed=RR_P5, tau=TAU))
             except Exception as e:
                 import traceback; print(f"  [ERROR] {method} seed={seed}: {e}"); traceback.print_exc()
 
