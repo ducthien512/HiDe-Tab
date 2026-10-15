@@ -9,15 +9,15 @@
 # ============================================================
 
 # Choose targer sample size: 5000 / 10000 / 20000
-TARGET_SIZE    = 5000
-DATA_PATH = "PIAAC PUF dataset\\Cycle 1\\prgczep1.csv" # Cycle 1
-#DATA_PATH = "PIAAC PUF dataset\\Cycle 2\\prgczep2.csv" # Cycle 2
+TARGET_SIZE    = 10000
+#DATA_PATH = "D:\\PhD\\PROJECT\\OPEN SCIENCE II\\PIAAC PUF dataset\\Cycle 1\\prgczep1.csv" # Cycle 1
+DATA_PATH = "D:\\PhD\\PROJECT\\OPEN SCIENCE II\\PIAAC PUF dataset\\Cycle 2\\prgczep2.csv" # Cycle 2
 
 # Choose feature mode: 500 / 1000
-FEATURE_MODE   = 500
+FEATURE_MODE   = 1000
 
 # PIAAC cycle: 1 or 2
-CYCLE = 1
+CYCLE = 2
 
 assert CYCLE in (1, 2), "CYCLE must be 1 or 2"
 
@@ -508,6 +508,8 @@ def run_diffusion(X, n_generate, scaler, features):
     print("-" * 40)
     t0        = time.time()
     timesteps = 100
+
+    # ---- tiny MLP ----
     inp   = layers.Input(shape=(input_dim,))
     x     = layers.Dense(256, activation='relu')(inp)
     x     = layers.BatchNormalization()(x)
@@ -517,44 +519,79 @@ def run_diffusion(X, n_generate, scaler, features):
     out   = layers.Dense(input_dim)(x)
     model = Model(inp, out)
     model.compile(optimizer='adam', loss='mse')
+
     beta      = np.linspace(1e-4, 0.02, timesteps).astype(np.float32)
     alpha     = 1.0 - beta
     alpha_bar = np.cumprod(alpha)
-    X_noisy, X_target = [], []
-    for t in range(timesteps):
-        ab  = alpha_bar[t]
-        eps = np.random.normal(0, 1, X.shape).astype(np.float32)
-        X_noisy.append(np.sqrt(ab) * X + np.sqrt(1.0 - ab) * eps)
-        X_target.append(eps)
-    X_noisy  = np.vstack(X_noisy).astype(np.float32)
-    X_target = np.vstack(X_target).astype(np.float32)
-    print("  Training …")
-    hist = model.fit(X_noisy, X_target, epochs=100, batch_size=256,
-                     verbose=0, validation_split=0.1)
+
+    # ---------- FIX: build noisy batches on-the-fly ----------
+    X_f32        = X.astype(np.float32)
+    batch_size   = 256
+    steps_per_ep = int(np.ceil(len(X_f32) / batch_size))
+
+    def _batch_gen():
+        n = len(X_f32)
+        while True:
+            idx = np.random.permutation(n)
+            for i in range(0, n, batch_size):
+                xb  = X_f32[idx[i:i + batch_size]]
+                bs  = xb.shape[0]
+                t   = np.random.randint(0, timesteps, size=bs).astype(np.int64)
+                ab  = alpha_bar[t].reshape(-1, 1)
+                eps = np.random.normal(0, 1, xb.shape).astype(np.float32)
+                xn  = np.sqrt(ab) * xb + np.sqrt(1.0 - ab) * eps
+                yield xn, eps
+
+    ds = tf.data.Dataset.from_generator(
+        _batch_gen,
+        output_signature=(
+            tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
+        ),
+    ).prefetch(tf.data.AUTOTUNE)
+
+    print("  Training (on-the-fly noise) …")
+    hist_losses = []
+    EPOCHS = 100
+    for ep in range(1, EPOCHS + 1):
+        ep_loss, n_batches = 0.0, 0
+        for xn, eps in ds.take(steps_per_ep):
+            ep_loss   += model.train_on_batch(xn, eps)
+            n_batches += 1
+        ep_loss /= max(n_batches, 1)
+        hist_losses.append(ep_loss)
+        if ep % 20 == 0 or ep == EPOCHS:
+            print(f"    Diffusion ep {ep:3d}/{EPOCHS} loss={ep_loss:.5f}")
+
+    # ---------- DDIM sampling (unchanged logic) ----------
     ddim_steps = 20
-    step_idx   = np.linspace(0, timesteps-1, ddim_steps, dtype=int)[::-1]
+    step_idx   = np.linspace(0, timesteps - 1, ddim_steps, dtype=int)[::-1]
+
     @tf.function
     def denoise_step(x_t, ab_t, ab_prev):
         eps    = model(x_t, training=False)
         x0_hat = (x_t - tf.sqrt(1.0 - ab_t) * eps) / tf.sqrt(ab_t)
         x0_hat = tf.clip_by_value(x0_hat, -6.0, 6.0)
         return tf.sqrt(ab_prev) * x0_hat + tf.sqrt(1.0 - ab_prev) * eps
+
     print(f"  Generating {n_generate} samples (DDIM {ddim_steps} steps) …")
     x_gen = tf.constant(
         np.random.normal(0, 1, (n_generate, input_dim)).astype(np.float32))
     for i, t in enumerate(step_idx):
         ab_t    = tf.constant(alpha_bar[t], dtype=tf.float32)
         ab_prev = tf.constant(
-            alpha_bar[step_idx[i+1]] if i+1 < len(step_idx) else 1.0,
+            alpha_bar[step_idx[i + 1]] if i + 1 < len(step_idx) else 1.0,
             dtype=tf.float32)
         x_gen = denoise_step(x_gen, ab_t, ab_prev)
+
     x_gen = np.clip(x_gen.numpy(), -6.0, 6.0)
+
     return {
         'method': 'DIFFUSION',
         'data':   scaler.inverse_transform(x_gen),
         'time':   time.time() - t0,
-        'history': hist.history['loss'],
-        'final_loss': hist.history['loss'][-1],
+        'history': hist_losses,
+        'final_loss': hist_losses[-1],
     }
 
 if _HAS_TORCH:
@@ -1065,19 +1102,26 @@ if _HAS_TORCH:
             """
             1D-convolutional denoiser for z_v conditioned on z_sc.
             z_v is treated as a 1-D sequence of length lat_v with 1 channel.
-            FiLM scale+shift from z_sc is applied after every conv block.
+            FiLM scale+shift from (cond_proj(z_sc) + time_emb) is applied
+            after every conv block.
             """
+
             def __init__(self, lat_v, cond_dim, hid=256, n_blocks=4):
                 super().__init__()
                 self.time_mlp = nn.Sequential(
                     nn.Linear(1, hid), nn.SiLU(),
                     nn.Linear(hid, hid), nn.SiLU(),
                 )
-                # FiLM: maps cond + time to (scale, shift) per channel
+                # ---- FIX: project cond_dim → hid so it can be added to t_emb ----
+                self.cond_proj = nn.Sequential(
+                    nn.Linear(cond_dim, hid), nn.SiLU(),
+                    nn.Linear(hid, hid), nn.SiLU(),
+                )
+                # FiLM: maps the (hid)-dim conditioning to (scale, shift) per block
                 self.film_proj = nn.ModuleList([
                     nn.Sequential(
-                        nn.Linear(cond_dim, hid), nn.SiLU(),
-                        nn.Linear(hid, hid * 2),      # → [scale | shift]
+                        nn.Linear(hid, hid), nn.SiLU(),
+                        nn.Linear(hid, hid * 2),  # → [scale | shift]
                     ) for _ in range(n_blocks)
                 ])
                 self.input_conv = nn.Conv1d(1, hid, kernel_size=3, padding=1)
@@ -1098,16 +1142,19 @@ if _HAS_TORCH:
             def forward(self, z_v, t, cond):
                 # time embedding (B, hid)
                 t_emb = self.time_mlp(t.float().unsqueeze(-1) / PT_T_STEPS)
+                # ---- FIX: project cond to hid before adding ----
+                cond_h = self.cond_proj(cond)  # (B, hid)
+                cond_t = cond_h + t_emb  # (B, hid)  ← both dims = hid
+
                 # (B, 1, lat_v) → (B, hid, lat_v)
                 h = self.input_conv(z_v.unsqueeze(1))
                 for i, blk in enumerate(self.blocks):
                     h_res = blk(h)
-                    # FiLM conditioning from z_sc (+ absorb time via addition)
-                    film = self.film_proj[i](cond + t_emb)
-                    scale, shift = film.chunk(2, dim=-1)     # each (B, hid)
+                    film = self.film_proj[i](cond_t)  # (B, 2*hid)
+                    scale, shift = film.chunk(2, dim=-1)  # (B, hid) each
                     h_res = h_res * (1 + scale.unsqueeze(-1)) + shift.unsqueeze(-1)
-                    h = h + h_res                            # residual
-                out = self.out_conv(h).squeeze(1)            # (B, lat_v)
+                    h = h + h_res
+                out = self.out_conv(h).squeeze(1)  # (B, lat_v)
                 return self.final_proj(out)
 
         model_B = DiffNet1DCNN(lat_v=v_dim, cond_dim=sc_dim,
@@ -1922,28 +1969,88 @@ for feat in key_plot_features:
     n_methods = len(all_synthetic_data)
     ncols = min(3, n_methods + 1)
     nrows = (n_methods + 1 + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(6 * ncols, 4 * nrows))
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(6 * ncols, 4 * nrows)
+    )
     fig.suptitle(
-        f'Distribution: {feat}  |  Mode {FEATURE_MODE}', fontsize=14)
+        f'Distribution: {feat} | Mode {FEATURE_MODE}',
+        fontsize=14
+    )
+
     axs = axes.flatten() if hasattr(axes, 'flatten') else [axes]
-    axs[0].hist(df_clean[feat], bins=30, density=True,
-                alpha=0.8, color='steelblue', label='Real')
+
+    # FIX: Use integer-aligned, shared bins for AGE_R
+    if feat == "AGE_R":
+        bin_width = 2
+        bin_edges = np.arange(15.5, 67.5, bin_width)
+    else:
+        # Preserve the existing plotting behaviour for other features
+        bin_edges = 30
+
+    # Real-data distribution
+    real_values = pd.to_numeric(
+        df_clean[feat], errors='coerce'
+    ).dropna()
+
+    axs[0].hist(
+        real_values,
+        bins=bin_edges,
+        density=True,
+        alpha=0.8,
+        color='steelblue',
+        label='Real'
+    )
     axs[0].set_title('Real Data')
-    axs[0].set_xlabel(feat); axs[0].legend()
+    axs[0].set_xlabel(feat)
+    axs[0].set_ylabel('Density')
+    axs[0].legend()
+
+    # Real versus synthetic distributions
     for j, (tag, synth_df) in enumerate(all_synthetic_data.items()):
         ax = axs[j + 1]
-        ax.hist(df_clean[feat], bins=30, density=True,
-                alpha=0.5, color='steelblue', label='Real')
-        ax.hist(synth_df[feat], bins=30, density=True,
-                alpha=0.5, color='darkorange', label='Synthetic')
-        ax.set_title(tag); ax.set_xlabel(feat); ax.legend()
+
+        real_values = pd.to_numeric(
+            df_clean[feat], errors='coerce'
+        ).dropna()
+
+        synth_values = pd.to_numeric(
+            synth_df[feat], errors='coerce'
+        ).dropna()
+
+        ax.hist(
+            real_values,
+            bins=bin_edges,
+            density=True,
+            alpha=0.5,
+            color='steelblue',
+            label='Real'
+        )
+        ax.hist(
+            synth_values,
+            bins=bin_edges,
+            density=True,
+            alpha=0.5,
+            color='darkorange',
+            label='Synthetic'
+        )
+
+        ax.set_title(tag)
+        ax.set_xlabel(feat)
+        ax.set_ylabel('Density')
+        ax.legend()
+
+    # Hide unused subplot cells
     for k in range(n_methods + 1, len(axs)):
         axs[k].set_visible(False)
-    plt.tight_layout()
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(
         f"outputs/comparison/dist_{feat}_mode{FEATURE_MODE}.png",
-        dpi=150, bbox_inches='tight')
+        dpi=300,
+        bbox_inches='tight'
+    )
     plt.close()
 
 hm_features = features[:20]
