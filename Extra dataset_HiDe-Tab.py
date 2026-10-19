@@ -20,7 +20,7 @@ FIXED_THR = {"gss": 0.5}          # datasets whose _target_src is already an ind
 N_SYNTH = 20000
 N_SEEDS = 3
 OUTPUT_DIR = "outputs_extra"
-CALIBRATE_NUMERIC = False          # if True, applied to ALL methods equally
+CALIBRATE_NUMERIC = True          # if True, applied to ALL methods equally
 
 EPOCHS_VAE_PRETRAIN = 80
 EPOCHS_GAN = 150

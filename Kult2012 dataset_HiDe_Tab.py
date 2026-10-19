@@ -1841,9 +1841,22 @@ def run_one(name, train_fn, X_gpu, proc, real_df, n_synth, pure_syn, X_real_enc,
     m=evaluate_all(name,real_df,syn_df,X_real_enc,Xs,proc)
     m["time_s"]=round(time.time()-t0,1); m["n_synth"]=n_synth; m["seed"]=seed
     m["numeric_oob_frac"]=round(oob_frac,5)   # <-- NEW
-    print(f"    JSD={m['jsd_mean']}  AvgD={m['avg_cohens_d']}  CorrDiff={m['corr_diff']}\n"
-          f"    Acc={m['ml_accuracy']}  F1={m['ml_f1_macro']}  AUC={m['ml_auc']}  R²={m['reg_r2']}\n"
-          f"    DCR={m['privacy_dcr']}  PR={m['privacy_ratio']}  OOB={m['numeric_oob_frac']}  ({m['time_s']}s)")
+    print(f"    ── Fidelity ──────────────────────────────────────")
+    print(f"    JSD      = {m['jsd_mean']}   (↓0)")
+    print(f"    Avg|d|   = {m['avg_cohens_d']}   (↓0)")
+    print(f"    CorrDiff = {m['corr_diff']}   (↓0)")
+    print(f"    StatSim  = {m.get('stat_sim','nan')}   (↑1)")
+    print(f"    ── Utility ───────────────────────────────────────")
+    print(f"    Accuracy = {m['ml_accuracy']}   (↑1)")
+    print(f"    F1 macro = {m['ml_f1_macro']}   (↑1)")
+    print(f"    AUC      = {m['ml_auc']}   (↑1)")
+    print(f"    R²       = {m['reg_r2']}   (↑1)")
+    print(f"    ── Privacy ───────────────────────────────────────")
+    print(f"    DCR      = {m['privacy_dcr']}   (↑high)")
+    print(f"    PR       = {m['privacy_ratio']}   (↑>1)")
+    print(f"    ── Other ─────────────────────────────────────────")
+    print(f"    OOB      = {m['numeric_oob_frac']}   (↓0)")
+    print(f"    Time     = {m['time_s']}s")
 
     # Plots (SEEDS[0] keeps the original file names; other seeds get a _seed suffix if enabled)
     if seed != SEEDS[0] and not PLOT_ALL_SEEDS:
@@ -1918,33 +1931,79 @@ def _dispatch(proc):
                     _W(train_hidetab_variant(X, proc, name=vn, loss_history=lh, **c)))
     return D
 
-_METRIC_COLS = ["jsd_mean","stat_sim","avg_cohens_d","corr_diff","ml_accuracy","ml_f1_macro",
-                "ml_auc","reg_r2","privacy_dcr","privacy_ratio","numeric_oob_frac","time_s"]
+_METRIC_COLS = [
+    # fidelity
+    "jsd_mean", "stat_sim", "avg_cohens_d", "corr_diff",
+    # utility
+    "ml_accuracy", "ml_f1_macro", "ml_auc", "reg_r2",
+    # privacy
+    "privacy_dcr", "privacy_ratio",
+    # auxiliary
+    "numeric_oob_frac", "time_s",
+]
+
+# Human-readable labels and ideal values for display
+_METRIC_META = {
+    "jsd_mean":         ("JSD",           "↓0"),
+    "stat_sim":         ("StatSim",        "↑1"),
+    "avg_cohens_d":     ("Avg|d|",         "↓0"),
+    "corr_diff":        ("CorrDiff",       "↓0"),
+    "ml_accuracy":      ("Accuracy",       "↑1"),
+    "ml_f1_macro":      ("F1",             "↑1"),
+    "ml_auc":           ("AUC",            "↑1"),
+    "reg_r2":           ("R²",             "↑1"),
+    "privacy_dcr":      ("DCR",            "↑high"),
+    "privacy_ratio":    ("PR",             "↑>1"),
+    "numeric_oob_frac": ("OOB",            "↓0"),
+    "time_s":           ("Time(s)",        "↓"),
+}
 
 def aggregate_seeds(results_all):
-    """per-seed rows -> (mean/std DataFrame, display DataFrame 'mean ± std', list of mean-dicts)."""
+    """
+    per-seed rows -> (df_all, df_ms, df_disp, mean_dicts)
+      df_all  : raw per-seed rows, all metrics numeric
+      df_ms   : one row per method, columns <metric>_mean and <metric>_std
+      df_disp : one row per method, columns formatted as "mean ± std"
+      mean_dicts : list of dicts {method: ..., metric: mean_value, ...}
+    """
     df_all = pd.DataFrame(results_all)
     for c in _METRIC_COLS:
-        df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
+        if c in df_all.columns:
+            df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
+
     order = [m for m in METHODS if m in set(df_all["method"])]
-    g = df_all.groupby("method")[_METRIC_COLS]
-    mean = g.mean().reindex(order); std = g.std(ddof=1).reindex(order).fillna(0.0)
-    cnt = df_all.groupby("method")["seed"].nunique().reindex(order)
-    ms = pd.DataFrame({"method": order, "n_seeds": cnt.values})
-    for c in _METRIC_COLS:
-        ms[f"{c}_mean"] = mean[c].round(4).values
-        ms[f"{c}_std"]  = std[c].round(4).values
-    disp = pd.DataFrame({"method": order})
-    for c in _METRIC_COLS:
-        disp[c] = [f"{a:.4f} ± {b:.4f}" if not math.isnan(a) else "nan"
-                   for a, b in zip(mean[c].values, std[c].values)]
+    present = [c for c in _METRIC_COLS if c in df_all.columns]
+
+    g    = df_all.groupby("method")[present]
+    mean = g.mean().reindex(order)
+    std  = g.std(ddof=1).reindex(order).fillna(0.0)
+    cnt  = df_all.groupby("method")["seed"].nunique().reindex(order)
+
+    # Wide CSV: one row per method, _mean and _std columns for every metric
+    df_ms = pd.DataFrame({"method": order, "n_seeds": cnt.values})
+    for c in present:
+        df_ms[f"{c}_mean"] = mean[c].round(4).values
+        df_ms[f"{c}_std"]  = std[c].round(4).values
+
+    # Display table: "mean ± std" strings
+    df_disp = pd.DataFrame({"method": order})
+    for c in present:
+        label, ideal = _METRIC_META.get(c, (c, ""))
+        df_disp[f"{label}({ideal})"] = [
+            f"{a:.4f}±{b:.4f}" if not math.isnan(a) else "nan"
+            for a, b in zip(mean[c].values, std[c].values)
+        ]
+
+    # Mean-only dicts for plotting
     mean_dicts = []
     for m in order:
         d = {"method": m}
-        for c in _METRIC_COLS:
-            v = float(mean.loc[m, c]); d[c] = round(v, 4) if not math.isnan(v) else "nan"
+        for c in present:
+            v = float(mean.loc[m, c])
+            d[c] = round(v, 4) if not math.isnan(v) else "nan"
         mean_dicts.append(d)
-    return df_all, ms, disp, mean_dicts
+
+    return df_all, df_ms, df_disp, mean_dicts
 
 def main():
     sep="═"*68
@@ -1978,16 +2037,43 @@ def main():
 
     if results:
         df_all, df_ms, df_disp, mean_dicts = aggregate_seeds(results)
-        df_all.to_csv(OUT/"summary_metrics_all_seeds.csv", index=False, encoding="utf-8-sig")
-        df_ms.to_csv(OUT/"summary_metrics_mean_std.csv", index=False, encoding="utf-8-sig")
+
+        # Save all three CSVs
+        df_all.to_csv(OUT/"summary_metrics_all_seeds.csv",  index=False, encoding="utf-8-sig")
+        df_ms.to_csv( OUT/"summary_metrics_mean_std.csv",   index=False, encoding="utf-8-sig")
         pd.DataFrame(mean_dicts).to_csv(OUT/"summary_metrics.csv", index=False, encoding="utf-8-sig")
         plot_comparison(mean_dicts)
-        cols = ["method"] + _METRIC_COLS
-        print(f"\n{sep}\n  SUMMARY  (mean ± std over seeds {SEEDS})\n{sep}")
-        print(df_disp[cols].to_string(index=False))
-        print(f"\n  per-seed CSV   → {(OUT/'summary_metrics_all_seeds.csv').resolve()}"
-              f"\n  mean ± std CSV → {(OUT/'summary_metrics_mean_std.csv').resolve()}"
-              f"\n  Plots          → {PLOT_DIR.resolve()}")
+
+        # ── Console summary: every metric on its own line, mean ± std ──────────
+        present_cols = [c for c in _METRIC_COLS if c in df_all.columns]
+        order = [m for m in METHODS if m in set(df_all["method"])]
+
+        print(f"\n{sep}")
+        print(f"  SUMMARY  (mean ± std  over {len(SEEDS)} seeds: {SEEDS})")
+        print(f"  N_SYNTH={N_SYNTH}  dataset=Kult2012")
+        print(f"{sep}")
+
+        # Header row
+        hdr = f"  {'Metric':<18}  {'Ideal':>6}  " + \
+              "  ".join(f"{m:>22}" for m in order)
+        print(hdr)
+        print("  " + "─" * (len(hdr) - 2))
+
+        for c in present_cols:
+            label, ideal = _METRIC_META.get(c, (c, ""))
+            g   = df_all.groupby("method")[c]
+            mn  = g.mean().reindex(order)
+            sd  = g.std(ddof=1).reindex(order).fillna(0.0)
+            vals = "  ".join(
+                f"{float(mn[m]):>10.4f} ± {float(sd[m]):>7.4f}"
+                if not math.isnan(float(mn[m])) else f"{'nan':>22}"
+                for m in order
+            )
+            print(f"  {label:<18}  {ideal:>6}  {vals}")
+
+        print(f"\n  per-seed rows  → {(OUT/'summary_metrics_all_seeds.csv').resolve()}")
+        print(f"  mean ± std CSV → {(OUT/'summary_metrics_mean_std.csv').resolve()}")
+        print(f"  Plots          → {PLOT_DIR.resolve()}")
 
 if __name__=="__main__":
     main()
