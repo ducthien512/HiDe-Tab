@@ -10,8 +10,8 @@
 
 # Choose targer sample size: 5000 / 10000 / 20000
 TARGET_SIZE    = 10000
-#DATA_PATH = "D:\\PhD\\PROJECT\\OPEN SCIENCE II\\PIAAC PUF dataset\\Cycle 1\\prgczep1.csv" # Cycle 1
-DATA_PATH = "D:\\PhD\\PROJECT\\OPEN SCIENCE II\\PIAAC PUF dataset\\Cycle 2\\prgczep2.csv" # Cycle 2
+#DATA_PATH = "PIAAC PUF dataset\\Cycle 1\\prgczep1.csv" # Cycle 1
+DATA_PATH = "PIAAC PUF dataset\\Cycle 2\\prgczep2.csv" # Cycle 2
 
 # Choose feature mode: 500 / 1000
 FEATURE_MODE   = 1000
@@ -52,6 +52,8 @@ PT_LAT_C        = 24
 PT_CAT_TEMP            = 0.8
 PT_NUM_LOSS_WEIGHT     = 80.0
 PT_NUM_FT_EXTRA        = 6.0
+
+CALIBRATE_NUMERIC = True
 
 # TabSyn specific
 PT_TABSYN_LATENT       = 64
@@ -118,6 +120,27 @@ if _HAS_TORCH:
         torch.backends.cudnn.benchmark = False
 
 CURRENT_SEED = SEEDS[0]      # read at call time by evaluate_method / evaluate_method_repeated
+
+def _calibrate_encoded(gen: np.ndarray, X_real: np.ndarray) -> np.ndarray:
+    """
+    Shift and scale each column of the encoded synthetic array so its mean
+    and std match the real training encoded array X_real.
+    PIAAC features are standardised (z-scored) so this operates directly on
+    the StandardScaler-encoded space — equivalent to calibrating in the original
+    space but before scaler.inverse_transform.
+    Applied uniformly to ALL methods when CALIBRATE_NUMERIC=True.
+    """
+    out = gen.copy().astype(np.float32)
+    for d in range(out.shape[1]):
+        r_mu  = float(X_real[:, d].mean())
+        r_std = float(X_real[:, d].std())
+        s_mu  = float(out[:, d].mean())
+        s_std = float(out[:, d].std())
+        if s_std < 1e-6:
+            s_std = 1e-6
+        out[:, d] = (out[:, d] - s_mu) / s_std * r_std + r_mu
+    return out
+
 
 def set_all_seeds(seed):
     """Re-seed Python, NumPy, TensorFlow and PyTorch and update CURRENT_SEED."""
@@ -1737,6 +1760,16 @@ for seed_idx, SEED_I in enumerate(SEEDS):
             if result.get('_skipped'):
                 print(f"  ⚠ {result['method']} was skipped.")
                 continue
+            # Calibrate encoded array uniformly across all methods (CALIBRATE_NUMERIC=True)
+            # result['data'] is already in original scale (scaler.inverse_transform was
+            # applied inside each run_* function).  Re-encode → calibrate → re-decode.
+            if CALIBRATE_NUMERIC:
+                _gen_enc = scaler.transform(
+                    pd.DataFrame(result['data'], columns=features).values
+                    .astype(np.float32))
+                _gen_enc = _calibrate_encoded(_gen_enc, X)
+                _gen_cal = scaler.inverse_transform(_gen_enc)
+                result['data'] = _gen_cal
             synth_df = pd.DataFrame(result['data'], columns=features)
             synth_df = postprocess(synth_df)
             tag = result['method']

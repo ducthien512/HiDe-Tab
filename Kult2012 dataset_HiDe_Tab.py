@@ -11,13 +11,14 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 DATA_PATH = (
-    r"D:\PhD\PROJECT\OPEN SCIENCE II\New dataset\dataverse_files"
+    r"New dataset\dataverse_files"
     r"\Kult2012_3kraje_UstVysZli_CSDA_pub_nove_bez_jmen.sav"
 )
 
 # Choose targer sample size: 5000 / 10000 / 20000
 N_SYNTH        = 5000
 PURE_SYNTHETIC = True
+CALIBRATE_NUMERIC = True
 
 # Independent runs: every method is re-trained, re-sampled and re-evaluated once per seed,
 SEEDS          = [42, 43, 44]
@@ -1827,8 +1828,9 @@ def run_one(name, train_fn, X_gpu, proc, real_df, n_synth, pure_syn, X_real_enc,
     # Clip numeric
     for d in proc.num_dims: Xs[:,d]=np.clip(Xs[:,d],0.0,1.0)
 
-    # Numeric calibration
-    Xs = _calibrate_numeric(Xs, X_real_enc, proc.num_dims)
+    # Numeric calibration — applied to ALL methods when CALIBRATE_NUMERIC=True
+    if CALIBRATE_NUMERIC and proc.num_dims:
+        Xs = _calibrate_numeric(Xs, X_real_enc, proc.num_dims)
 
     syn_df=proc.inverse_transform(Xs)
     fp=OUT/f"{name}_synthetic_n{n_synth}_seed{seed}.csv"
