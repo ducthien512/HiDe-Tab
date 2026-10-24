@@ -11,7 +11,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 DATA_PATH = (
-    r"New dataset\dataverse_files"
+    r"D:\PhD\PROJECT\OPEN SCIENCE II\New dataset\dataverse_files"
     r"\Kult2012_3kraje_UstVysZli_CSDA_pub_nove_bez_jmen.sav"
 )
 
@@ -28,10 +28,10 @@ METHODS = [
     "CTGAN",
     "Diffusion",
     "HiDe_Tab",          # full model (two-stage, TC, FiLM)
-    "HiDeTab_noTC",      # ablation: no TC penalty
-    "HiDeTab_1Stage",    # ablation: one flat diffusion stage
-    "HiDeTab_3Stage",    # ablation: three sequential stages
-    "HiDeTab_noFiLM",    # ablation: no FiLM conditioning in Stage B
+    #"HiDeTab_noTC",      # ablation: no TC penalty
+    #"HiDeTab_1Stage",    # ablation: one flat diffusion stage
+    #"HiDeTab_3Stage",    # ablation: three sequential stages
+    #"HiDeTab_noFiLM",    # ablation: no FiLM conditioning in Stage B
     "TabDiff",
     "TabSyn",
 ]
